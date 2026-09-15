@@ -38,9 +38,22 @@
 --     inserting that category fails on the NOT NULL role column.
 --   * Money is price_minor plus an ISO 4217 currency. Instants are timestamptz.
 --     A "day" is a date computed from an instant and an IANA time zone name.
---   * Optional free text is NULL, never ''. jsonb is used only for payloads
---     whose shape is versioned elsewhere: a weather provider's snapshot, the
---     inputs behind a recognizer_version's score, an event's detail.
+--   * Optional free text is NULL, never '', and every text column has a
+--     nonempty CHECK. jsonb is used only for payloads whose shape is versioned
+--     elsewhere (a weather provider's snapshot, the inputs behind a
+--     recognizer_version's score, an event's free-form detail) and never
+--     holds an id: anything that references a row is a foreign key column.
+--   * A user deletes a garment softly (deleted_at). The garments policy
+--     grants no DELETE, so a user session's DELETE affects zero rows and the
+--     store layer must treat that as a bug. Every key from history to
+--     garments (outfits, suggestions, candidates, corrections, swaps) is
+--     NO ACTION DEFERRABLE INITIALLY DEFERRED as a second guard. Hard deletes
+--     happen only through the account-deletion cascade, which the deferral
+--     is for: the users cascade reaches garments before the tables that
+--     reference them.
+--   * Enum and text arrays never contain NULL elements; a NULL inside an
+--     exclusion list would turn suggest's NOT (x = ANY(list)) into NULL and
+--     filter out the whole closet.
 --   * Object storage keys are stored, never URLs. Raw camera frames are never
 --     stored anywhere and have no table.
 -- =============================================================================
@@ -181,7 +194,7 @@ BEGIN
     RETURN true;
 EXCEPTION WHEN invalid_parameter_value THEN
     RETURN false;
-END
+END;
 $$;
 
 -- The outfit_role a category fills by default. Backs garments.role. Returns
@@ -231,6 +244,8 @@ CREATE TABLE users (
 
     CONSTRAINT users_apple_sub_nonempty
         CHECK (apple_sub IS NULL OR apple_sub <> ''),
+    CONSTRAINT users_weather_location_nonempty
+        CHECK (weather_location IS NULL OR weather_location <> ''),
     CONSTRAINT users_timezone_valid
         CHECK (is_valid_timezone(timezone)),
     CONSTRAINT users_weather_all_or_none
@@ -311,19 +326,26 @@ CREATE TABLE garments (
     -- Archived: still owned, never suggested, still recognized.
     archived_at      timestamptz,
     -- Deleted: gone from the closet and its images purged, but the row stays
-    -- so outfits that include it keep their history. A garment that was ever
-    -- worn or suggested cannot be hard-deleted: the deferred keys on
-    -- outfit_items and suggested_outfit_items refuse it at commit.
+    -- so history that references it stays whole. This is the only delete a
+    -- user can perform: the policy below grants no DELETE, and the deferred
+    -- keys from history refuse a hard delete at commit even for the system
+    -- role.
     deleted_at       timestamptz,
     created_at       timestamptz      NOT NULL DEFAULT now(),
     updated_at       timestamptz      NOT NULL DEFAULT now(),
 
     CONSTRAINT garments_name_nonempty
         CHECK (name <> ''),
+    CONSTRAINT garments_brand_nonempty
+        CHECK (brand IS NULL OR brand <> ''),
+    CONSTRAINT garments_color_nonempty
+        CHECK (color IS NULL OR color <> ''),
     CONSTRAINT garments_warmth_range
         CHECK (warmth IS NULL OR warmth BETWEEN 1 AND 5),
     CONSTRAINT garments_wash_after_wears_positive
         CHECK (wash_after_wears IS NULL OR wash_after_wears > 0),
+    CONSTRAINT garments_season_tags_no_nulls
+        CHECK (array_position(season_tags, NULL) IS NULL),
     CONSTRAINT garments_price_and_currency_together
         CHECK ((price_minor IS NULL) = (currency IS NULL)),
     CONSTRAINT garments_price_nonnegative
@@ -358,6 +380,8 @@ CREATE TABLE garment_exemplars (
 
     CONSTRAINT garment_exemplars_image_key_key
         UNIQUE (image_key),
+    CONSTRAINT garment_exemplars_image_key_nonempty
+        CHECK (image_key <> ''),
     CONSTRAINT garment_exemplars_quality_range
         CHECK (quality IS NULL OR quality BETWEEN 0 AND 1),
     CONSTRAINT garment_exemplars_initial_has_no_candidate
@@ -446,29 +470,29 @@ CREATE INDEX observed_fits_open_expires_at_idx
 
 
 -- A temporary image derived during analysis: a garment crop, or the photo a
--- phone user submitted. Lives in the TTL bucket. The row is deleted together
--- with the object when the fit closes or the asset expires, whichever comes
--- first. Promotion (confirm, add, log) copies the object into retained
--- storage as a garment_exemplar or an outfit history photo; it never
--- extends the asset's life.
+-- phone user submitted. Lives in the TTL bucket. An asset lives exactly as
+-- long as its fit and has no expiry of its own: an asset created later than
+-- the fit could never outlive it anyway, so the fit's expires_at and
+-- closed_at are the only clock. The sweeper deletes the row together with
+-- the object once the fit is closed or past expires_at; the bucket's
+-- lifecycle rule is the backstop. Promotion (confirm, add, log) copies the
+-- object into retained storage as a garment_exemplar or an outfit history
+-- photo; it never extends the asset's life.
 CREATE TABLE analysis_assets (
     id              uuid                PRIMARY KEY DEFAULT gen_random_uuid(),
     observed_fit_id uuid                NOT NULL REFERENCES observed_fits (id) ON DELETE CASCADE,
     kind            analysis_asset_kind NOT NULL,
     -- Key in the TTL bucket.
     object_key      text                NOT NULL,
-    expires_at      timestamptz         NOT NULL DEFAULT (now() + interval '30 minutes'),
     created_at      timestamptz         NOT NULL DEFAULT now(),
 
     CONSTRAINT analysis_assets_object_key_key
         UNIQUE (object_key),
-    CONSTRAINT analysis_assets_ttl_at_most_30_minutes
-        CHECK (expires_at <= created_at + interval '30 minutes')
+    CONSTRAINT analysis_assets_object_key_nonempty
+        CHECK (object_key <> '')
 );
 
 CREATE INDEX analysis_assets_observed_fit_id_idx ON analysis_assets (observed_fit_id);
-
-CREATE INDEX analysis_assets_expires_at_idx ON analysis_assets (expires_at);
 
 
 -- One detected garment in a fit and what recognition made of it. Recognition
@@ -482,8 +506,11 @@ CREATE TABLE recognition_candidates (
     analysis_asset_id     uuid                 REFERENCES analysis_assets (id) ON DELETE SET NULL,
     -- What the detector thought it was, before matching.
     detected_category     garment_category,
-    -- Top match, or NULL when the score is below the unknown threshold.
-    best_match_garment_id uuid                 REFERENCES garments (id) ON DELETE SET NULL,
+    -- The top match as recognition proposed it, or NULL when the score was
+    -- below the unknown threshold. Never rewritten: a proposal the user
+    -- declined stays here so a wrong ask is measurable.
+    best_match_garment_id uuid                 REFERENCES garments (id)
+                                               ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
     -- Composite recognition score in [0, 1].
     score                 double precision     NOT NULL,
     -- The inputs the score formula saw (top-1 similarity, margin, exemplar
@@ -496,8 +523,9 @@ CREATE TABLE recognition_candidates (
     resolution            candidate_resolution NOT NULL DEFAULT 'pending',
     -- The garment this candidate finally stands for, once resolved. Equals
     -- best_match for auto/confirmed, the correction target for corrected/new,
-    -- NULL for pending/unknown or if the garment row is gone.
-    resolved_garment_id   uuid                 REFERENCES garments (id) ON DELETE SET NULL,
+    -- NULL for pending/unknown.
+    resolved_garment_id   uuid                 REFERENCES garments (id)
+                                               ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
     resolved_at           timestamptz,
     -- OpenTelemetry trace of the assistant turn that produced this row.
     trace_id              text,
@@ -507,18 +535,24 @@ CREATE TABLE recognition_candidates (
         CHECK (score BETWEEN 0 AND 1),
     CONSTRAINT recognition_candidates_recognizer_version_nonempty
         CHECK (recognizer_version <> ''),
+    CONSTRAINT recognition_candidates_trace_id_nonempty
+        CHECK (trace_id IS NULL OR trace_id <> ''),
     CONSTRAINT recognition_candidates_resolved_at_iff_resolved
         CHECK ((resolution = 'pending') = (resolved_at IS NULL)),
-    CONSTRAINT recognition_candidates_unresolved_has_no_garment
-        CHECK (resolution NOT IN ('pending', 'unknown') OR resolved_garment_id IS NULL),
-    -- Either side may be NULL: ON DELETE SET NULL clears the two columns in
-    -- separate updates, and a CHECK that compared them strictly would fail
-    -- between the two and block the delete.
-    CONSTRAINT recognition_candidates_accepted_matches_best
-        CHECK (resolution NOT IN ('auto', 'confirmed')
-            OR best_match_garment_id IS NULL
-            OR resolved_garment_id IS NULL
-            OR resolved_garment_id = best_match_garment_id)
+    -- The recognition contract, state by state.
+    CONSTRAINT recognition_candidates_resolved_garment_by_state
+        CHECK (CASE resolution
+            WHEN 'pending'   THEN resolved_garment_id IS NULL
+            WHEN 'unknown'   THEN resolved_garment_id IS NULL
+            WHEN 'auto'      THEN best_match_garment_id IS NOT NULL
+                              AND resolved_garment_id = best_match_garment_id
+            WHEN 'confirmed' THEN best_match_garment_id IS NOT NULL
+                              AND resolved_garment_id = best_match_garment_id
+            WHEN 'corrected' THEN resolved_garment_id IS NOT NULL
+                              AND resolved_garment_id IS DISTINCT FROM best_match_garment_id
+            WHEN 'new'       THEN resolved_garment_id IS NOT NULL
+                              AND resolved_garment_id IS DISTINCT FROM best_match_garment_id
+        END)
 );
 
 CREATE INDEX recognition_candidates_observed_fit_id_idx
@@ -561,10 +595,14 @@ CREATE INDEX recognition_alternatives_garment_id_idx
     ON recognition_alternatives (garment_id);
 
 
--- The user overriding a match. Confirming best_match is not a correction
--- (the candidate just becomes 'confirmed'); choosing another garment,
--- adding a new one, or saying "none of mine" is. The candidate's crop is
--- promoted to a garment_exemplar of to_garment_id when it is not NULL.
+-- The user overriding a match. A correction changes what the candidate
+-- stands for: from the proposed garment to another existing one, to a
+-- garment created on the spot, or to nothing ("none of mine"). Confirming
+-- the proposal is not a correction; the candidate just becomes 'confirmed'.
+-- Rejecting a proposal that was never made is not one either: recognition
+-- said unknown, the user agreed, and the candidate becomes 'unknown' with no
+-- row here. The candidate's crop is promoted to a garment_exemplar of
+-- to_garment_id when it is not NULL.
 CREATE TABLE corrections (
     id               uuid                 PRIMARY KEY DEFAULT gen_random_uuid(),
     candidate_id     uuid                 NOT NULL REFERENCES recognition_candidates (id) ON DELETE CASCADE,
@@ -572,15 +610,18 @@ CREATE TABLE corrections (
     -- false silent match, the metric recognition is tuned against.
     prior_resolution candidate_resolution NOT NULL,
     -- best_match at the time, or NULL if recognition had said unknown.
-    from_garment_id  uuid                 REFERENCES garments (id) ON DELETE SET NULL,
+    from_garment_id  uuid                 REFERENCES garments (id)
+                                          ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
     -- The garment the user chose, whether existing or created for this
     -- correction. NULL means "not one of mine, and don't add it".
-    to_garment_id    uuid                 REFERENCES garments (id) ON DELETE SET NULL,
+    to_garment_id    uuid                 REFERENCES garments (id)
+                                          ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
     created_at       timestamptz          NOT NULL DEFAULT now(),
 
+    -- A correction must change something. from and to may each be NULL,
+    -- but not both.
     CONSTRAINT corrections_changes_something
-        CHECK (from_garment_id IS NULL OR to_garment_id IS NULL
-            OR from_garment_id <> to_garment_id)
+        CHECK (from_garment_id IS DISTINCT FROM to_garment_id)
 );
 
 CREATE INDEX corrections_candidate_id_idx ON corrections (candidate_id);
@@ -614,6 +655,10 @@ CREATE TABLE suggestions (
     trace_id         text,
     created_at       timestamptz NOT NULL DEFAULT now(),
 
+    CONSTRAINT suggestions_request_text_nonempty
+        CHECK (request_text IS NULL OR request_text <> ''),
+    CONSTRAINT suggestions_trace_id_nonempty
+        CHECK (trace_id IS NULL OR trace_id <> ''),
     CONSTRAINT suggestions_model_nonempty
         CHECK (model <> ''),
     CONSTRAINT suggestions_prompt_version_nonempty
@@ -670,16 +715,39 @@ CREATE INDEX suggested_outfit_items_garment_id_idx
     ON suggested_outfit_items (garment_id);
 
 
--- What the user did with one shown outfit. Append-only.
--- detail by type: item_swapped {role, from_garment_id, to_garment_id};
--- logged_as_is / logged_with_changes {outfit_id}; thumbs_down {reason}.
+-- What the user did with one shown outfit. Append-only: users can read and
+-- insert, never edit or delete. A swap names its garments in key columns.
+-- The outfit logged from a card is outfits.from_suggested_outfit_id, not a
+-- field here. detail carries only free-form payload, such as a thumbs_down
+-- reason, and never an id.
 CREATE TABLE recommendation_events (
     id                  uuid                      PRIMARY KEY DEFAULT gen_random_uuid(),
     suggested_outfit_id uuid                      NOT NULL REFERENCES suggested_outfits (id) ON DELETE CASCADE,
     type                recommendation_event_type NOT NULL,
+    -- item_swapped only: the slot, the garment swapped out, the one swapped in.
+    role                outfit_role,
+    from_garment_id     uuid                      REFERENCES garments (id)
+                                                  ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
+    to_garment_id       uuid                      REFERENCES garments (id)
+                                                  ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
     detail              jsonb,
-    created_at          timestamptz               NOT NULL DEFAULT now()
+    created_at          timestamptz               NOT NULL DEFAULT now(),
+
+    CONSTRAINT recommendation_events_swap_fields_iff_swap
+        CHECK ((type = 'item_swapped')
+             = (role IS NOT NULL AND from_garment_id IS NOT NULL AND to_garment_id IS NOT NULL)),
+    CONSTRAINT recommendation_events_swap_fields_only_for_swaps
+        CHECK (type = 'item_swapped'
+            OR (role IS NULL AND from_garment_id IS NULL AND to_garment_id IS NULL)),
+    CONSTRAINT recommendation_events_swap_changes_garment
+        CHECK (type <> 'item_swapped' OR from_garment_id <> to_garment_id)
 );
+
+CREATE INDEX recommendation_events_from_garment_id_idx
+    ON recommendation_events (from_garment_id);
+
+CREATE INDEX recommendation_events_to_garment_id_idx
+    ON recommendation_events (to_garment_id);
 
 CREATE INDEX recommendation_events_suggested_outfit_created_idx
     ON recommendation_events (suggested_outfit_id, created_at);
@@ -727,7 +795,9 @@ CREATE TABLE outfits (
     CONSTRAINT outfits_idempotency_key_key
         UNIQUE (user_id, idempotency_key),
     CONSTRAINT outfits_history_photo_key_key
-        UNIQUE (history_photo_key)
+        UNIQUE (history_photo_key),
+    CONSTRAINT outfits_history_photo_key_nonempty
+        CHECK (history_photo_key IS NULL OR history_photo_key <> '')
 );
 
 CREATE UNIQUE INDEX outfits_from_observed_fit_id_key
@@ -795,7 +865,14 @@ CREATE TABLE style_profiles (
     excluded_color_families color_family[]     NOT NULL DEFAULT '{}',
     notes                   text[]             NOT NULL DEFAULT '{}',
     created_at              timestamptz        NOT NULL DEFAULT now(),
-    updated_at              timestamptz        NOT NULL DEFAULT now()
+    updated_at              timestamptz        NOT NULL DEFAULT now(),
+
+    CONSTRAINT style_profiles_excluded_categories_no_nulls
+        CHECK (array_position(excluded_categories, NULL) IS NULL),
+    CONSTRAINT style_profiles_excluded_color_families_no_nulls
+        CHECK (array_position(excluded_color_families, NULL) IS NULL),
+    CONSTRAINT style_profiles_notes_elements_nonempty
+        CHECK (array_position(notes, NULL) IS NULL AND NOT ('' = ANY (notes)))
 );
 
 
@@ -859,7 +936,7 @@ CREATE FUNCTION set_updated_at() RETURNS trigger
 BEGIN
     NEW.updated_at := now();
     RETURN NEW;
-END
+END;
 $$;
 
 CREATE TRIGGER users_set_updated_at
@@ -893,7 +970,7 @@ BEGIN
             USING ERRCODE = 'check_violation';
     END IF;
     RETURN NEW;
-END
+END;
 $$;
 
 CREATE TRIGGER exemplar_embeddings_check_dims
@@ -975,10 +1052,19 @@ CREATE POLICY devices_owner ON devices
     USING (user_id = vird_user_id())
     WITH CHECK (user_id = vird_user_id());
 
+-- No DELETE policy: a user deletes a garment by setting deleted_at. A
+-- user session's DELETE FROM garments affects zero rows; only the
+-- account-deletion cascade, run by vird_system, removes garment rows.
 ALTER TABLE garments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE garments FORCE ROW LEVEL SECURITY;
-CREATE POLICY garments_owner ON garments
-    FOR ALL
+CREATE POLICY garments_read ON garments
+    FOR SELECT
+    USING (user_id = vird_user_id());
+CREATE POLICY garments_insert ON garments
+    FOR INSERT
+    WITH CHECK (user_id = vird_user_id());
+CREATE POLICY garments_update ON garments
+    FOR UPDATE
     USING (user_id = vird_user_id())
     WITH CHECK (user_id = vird_user_id());
 
@@ -1068,12 +1154,17 @@ CREATE POLICY suggested_outfit_items_owner ON suggested_outfit_items
     USING (owns_suggested_outfit(suggested_outfit_id))
     WITH CHECK (owns_suggested_outfit(suggested_outfit_id) AND owns_garment(garment_id));
 
+-- Append-only for users, like image_audit_log.
 ALTER TABLE recommendation_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE recommendation_events FORCE ROW LEVEL SECURITY;
-CREATE POLICY recommendation_events_owner ON recommendation_events
-    FOR ALL
-    USING (owns_suggested_outfit(suggested_outfit_id))
-    WITH CHECK (owns_suggested_outfit(suggested_outfit_id));
+CREATE POLICY recommendation_events_read ON recommendation_events
+    FOR SELECT
+    USING (owns_suggested_outfit(suggested_outfit_id));
+CREATE POLICY recommendation_events_append ON recommendation_events
+    FOR INSERT
+    WITH CHECK (owns_suggested_outfit(suggested_outfit_id)
+        AND (from_garment_id IS NULL OR owns_garment(from_garment_id))
+        AND (to_garment_id IS NULL OR owns_garment(to_garment_id)));
 
 ALTER TABLE outfits ENABLE ROW LEVEL SECURITY;
 ALTER TABLE outfits FORCE ROW LEVEL SECURITY;
