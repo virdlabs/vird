@@ -1,0 +1,56 @@
+# Local development. Postgres with pgvector, plus tool images so nothing has
+# to be installed on the machine: `make` picks a local go, sqlc or migrate
+# when one is on PATH and falls back to these services otherwise.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: vird
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs once, on first start, as the superuser: extension and roles.
+      - ./backend/store/bootstrap:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d vird"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  migrate:
+    image: migrate/migrate:v4.18.3
+    profiles: [tools]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./backend/store/migrations:/migrations:ro
+    entrypoint:
+      - migrate
+      - -path=/migrations
+      - -database=postgres://vird_system:vird_system@postgres:5432/vird?sslmode=disable
+
+  sqlc:
+    image: sqlc/sqlc:1.29.0
+    profiles: [tools]
+    working_dir: /repo/backend
+    volumes:
+      - .:/repo
+
+  go:
+    image: golang:1.25-alpine
+    profiles: [tools]
+    working_dir: /repo/backend
+    entrypoint: ["go"]
+    volumes:
+      - .:/repo
+      - gomod:/go/pkg/mod
+      - gocache:/root/.cache/go-build
+
+volumes:
+  pgdata:
+  gomod:
+  gocache:

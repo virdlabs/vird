@@ -31,7 +31,7 @@ docs/       design.md, schema.sql, decisions.md
 
 ## Stack and conventions
 
-- Go 1.23+, standard library HTTP, `pgx`, `sqlc` for queries, `golang-migrate` for migrations generated from `docs/schema.sql`. Table-driven tests. No ORM.
+- Go 1.25+ (pgx v5.11 and pgvector-go require it), standard library HTTP, `pgx`, `sqlc` for queries, `golang-migrate` for migrations generated from `docs/schema.sql`. Table-driven tests. No ORM.
 - Postgres with `pgvector` (exact search; no ANN index yet). S3-compatible object storage with a TTL bucket for analysis assets.
 - OpenTelemetry for tracing, Prometheus for metrics.
 - SwiftUI, iOS 18+, Swift concurrency. Vision framework for subject lift on catalog photos only.
@@ -41,14 +41,18 @@ docs/       design.md, schema.sql, decisions.md
 
 ## Commands
 
-Fill in as they exist:
+Nothing has to be installed: each target uses a local `go`, `sqlc` or `migrate` when one is on PATH and the pinned images in `compose.yaml` otherwise.
 
 ```
-make dev          # run backend locally against docker-compose postgres
-make test         # go test ./...
-make migrate      # apply migrations
-make bench        # run the recognition benchmark (backend/recognition/bench)
+make db           # start docker-compose postgres (pgvector, roles bootstrapped)
+make migrate      # apply migrations as vird_system; ARGS="down 1", ARGS=version
+make sqlc         # regenerate backend/store from docs/schema.sql and store/queries
+make migrations   # refresh the first migration, a verbatim copy of docs/schema.sql
+make test         # go vet + go test ./...
+make down         # stop compose services, keep the data volume
 ```
+
+Not yet: `make dev` (run the backend, arrives with the skeleton) and `make bench` (recognition benchmark, `backend/recognition/bench`).
 
 ## Working with me
 

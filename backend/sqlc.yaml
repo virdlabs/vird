@@ -1,0 +1,153 @@
+# sqlc reads docs/schema.sql, the source of truth for the data model, and
+# writes the Go types and query methods into the store package.
+# Regenerate with `make sqlc`; never edit the generated files by hand.
+version: "2"
+sql:
+  - engine: "postgresql"
+    schema: "../docs/schema.sql"
+    queries: "store/queries"
+    gen:
+      go:
+        package: "store"
+        out: "store"
+        sql_package: "pgx/v5"
+        emit_enum_valid_method: true
+        emit_all_enum_values: true
+        # Nullable columns become pointers (*string, *int16, *time.Time,
+        # *GarmentFit) instead of database/sql Null* wrappers.
+        emit_pointers_for_null_types: true
+        overrides:
+          - db_type: "uuid"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+          - db_type: "uuid"
+            nullable: true
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+              pointer: true
+          # sqlc reports the column type as written in the DDL, so both the
+          # alias and the catalog name are listed.
+          - db_type: "timestamptz"
+            go_type:
+              import: "time"
+              type: "Time"
+          - db_type: "timestamptz"
+            nullable: true
+            go_type:
+              import: "time"
+              type: "Time"
+              pointer: true
+          - db_type: "pg_catalog.timestamptz"
+            go_type:
+              import: "time"
+              type: "Time"
+          - db_type: "pg_catalog.timestamptz"
+            nullable: true
+            go_type:
+              import: "time"
+              type: "Time"
+              pointer: true
+          # jsonb holds versioned payloads whose shape is owned elsewhere
+          # (a weather snapshot, score inputs); the store keeps them opaque.
+          - db_type: "jsonb"
+            go_type:
+              import: "encoding/json"
+              type: "RawMessage"
+          - db_type: "jsonb"
+            nullable: true
+            go_type:
+              import: "encoding/json"
+              type: "RawMessage"
+          # pgvector. The structured form is required here; the string form
+          # does not resolve the package name.
+          - db_type: "vector"
+            go_type:
+              import: "github.com/pgvector/pgvector-go"
+              package: "pgvector"
+              type: "Vector"
+          # emit_pointers_for_null_types does not cover enums; without these a
+          # nullable enum column becomes a Null<Enum> wrapper. One entry per
+          # enum in docs/schema.sql, so a new nullable column of any enum type
+          # comes out as a pointer like every other nullable column.
+          - db_type: "garment_category"
+            nullable: true
+            go_type:
+              type: "GarmentCategory"
+              pointer: true
+          - db_type: "outfit_role"
+            nullable: true
+            go_type:
+              type: "OutfitRole"
+              pointer: true
+          - db_type: "color_family"
+            nullable: true
+            go_type:
+              type: "ColorFamily"
+              pointer: true
+          - db_type: "garment_fit"
+            nullable: true
+            go_type:
+              type: "GarmentFit"
+              pointer: true
+          - db_type: "season"
+            nullable: true
+            go_type:
+              type: "Season"
+              pointer: true
+          - db_type: "garment_pattern"
+            nullable: true
+            go_type:
+              type: "GarmentPattern"
+              pointer: true
+          - db_type: "garment_material"
+            nullable: true
+            go_type:
+              type: "GarmentMaterial"
+              pointer: true
+          - db_type: "capture_source"
+            nullable: true
+            go_type:
+              type: "CaptureSource"
+              pointer: true
+          - db_type: "exemplar_creation_reason"
+            nullable: true
+            go_type:
+              type: "ExemplarCreationReason"
+              pointer: true
+          - db_type: "observed_fit_source"
+            nullable: true
+            go_type:
+              type: "ObservedFitSource"
+              pointer: true
+          - db_type: "observed_fit_status"
+            nullable: true
+            go_type:
+              type: "ObservedFitStatus"
+              pointer: true
+          - db_type: "analysis_asset_kind"
+            nullable: true
+            go_type:
+              type: "AnalysisAssetKind"
+              pointer: true
+          - db_type: "candidate_resolution"
+            nullable: true
+            go_type:
+              type: "CandidateResolution"
+              pointer: true
+          - db_type: "recommendation_event_type"
+            nullable: true
+            go_type:
+              type: "RecommendationEventType"
+              pointer: true
+          - db_type: "image_kind"
+            nullable: true
+            go_type:
+              type: "ImageKind"
+              pointer: true
+          - db_type: "image_purpose"
+            nullable: true
+            go_type:
+              type: "ImagePurpose"
+              pointer: true
